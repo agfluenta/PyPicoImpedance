@@ -85,37 +85,39 @@ def setup_scope(handle):
 def set_siggen_sine(handle, freq_hz, vpp_uV=2_000_000):
     """
     Emit a steady sine at freq_hz with 0 offset using ps3000aSetSigGenBuiltIn.
+    All scalar args must be native Python ints/floats (not ctypes instances).
     """
     offset_uV = 0
-    waveType = 0   # PS3000A_SINE
-    startFrequency = ctypes.c_float(freq_hz)
-    stopFrequency  = ctypes.c_float(freq_hz)
-    increment      = ctypes.c_float(0.0)
-    dwellTime      = ctypes.c_float(0.0)
-    sweepType = 0  # PS3000A_UP (ignored for single-tone)
-    operation = 0  # PS3000A_ES_OFF
+    waveType = 0        # PS3000A_SINE
+    startFrequency = float(freq_hz)
+    stopFrequency  = float(freq_hz)
+    increment      = 0.0
+    dwellTime      = 0.0
+    sweepType = 0      # PS3000A_UP (ignored for single-tone)
+    operation = 0      # PS3000A_ES_OFF
     shots = 0
     sweeps = 0
-    triggerType = 0   # PS3000A_SIGGEN_TRIG_NONE (immediate output)
-    triggerSource = 0 # PS3000A_SIGGEN_NONE
-    extInThreshold = 0
+    triggerType = 0    # PS3000A_SIGGEN_TRIG_NONE
+    triggerSource = 0  # PS3000A_SIGGEN_NONE
+    extInThreshold = 0 # int16
 
     st = ps.ps3000aSetSigGenBuiltIn(
         handle,
-        ctypes.c_int32(offset_uV),
-        ctypes.c_uint32(vpp_uV),
-        ctypes.c_int32(waveType),
+        int(offset_uV),
+        int(vpp_uV),
+        int(waveType),
         startFrequency, stopFrequency,
         increment, dwellTime,
-        ctypes.c_int32(sweepType),
-        ctypes.c_int32(operation),
-        ctypes.c_uint32(shots),
-        ctypes.c_uint32(sweeps),
-        ctypes.c_int32(triggerType),
-        ctypes.c_int32(triggerSource),
-        ctypes.c_int16(extInThreshold)
+        int(sweepType),
+        int(operation),
+        int(shots),
+        int(sweeps),
+        int(triggerType),
+        int(triggerSource),
+        int(extInThreshold)
     )
     assert_pico_ok(st)
+
 
 
 def stop_siggen(handle):
@@ -158,11 +160,16 @@ def acquire_block_two_channels(handle, timebase, n_samples):
     return np.frombuffer(bufA_max, dtype=np.int16, count=n_samples), np.frombuffer(bufB_max, dtype=np.int16, count=n_samples)
 
 def counts_to_volts(handle, counts_array, ch_range):
+    # counts_array can be a numpy array or ctypes buffer
     maxADC = ctypes.c_int16()
     st = ps.ps3000aMaximumValue(handle, ctypes.byref(maxADC))
     assert_pico_ok(st)
-    mv = adc2mV(counts_array, ch_range, maxADC)  # returns numpy array (mV)
-    return mv * 1e-3  # to volts
+
+    # Ensure adc2mV sees *plain Python ints*, not numpy.int16, to avoid overflow
+    mv_list = adc2mV(counts_array.tolist(), ch_range, maxADC)   # -> list of mV
+    mv = np.asarray(mv_list, dtype=np.float64)                  # -> float array
+    return mv * 1e-3                                            # mV -> V
+
 
 def trim_settle_cycles(x, fs, f_tone, settle_cycles):
     n_settle = int(round(settle_cycles * fs / f_tone))
