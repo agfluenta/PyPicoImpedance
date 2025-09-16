@@ -1,2 +1,4 @@
 picosdk
 numpy
+matplotlib
+PyQt5
