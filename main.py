@@ -1,169 +1,274 @@
-#
-# Copyright (C) 2018 Pico Technology Ltd. See LICENSE file for terms.
-#
-# PS3000A BLOCK MODE EXAMPLE
-# This example opens a 3000a driver device, sets up one channels and a trigger then collects a block of data.
-# This data is then plotted as mV against time in ns.
+# Impedance analyzer (PS3000A) — swept sine, 30–60 kHz, 2 Vpp, ~2000 pts/dec
+# Channels: CH A = Vdut, CH B = Vshunt. Current I = Vshunt / Rs, Z = Vdut / I
+# Requires: picosdk Python wrappers installed and PS3000A driver.
+# Tested pattern follows Pico's block-mode examples (OpenUnit, SetChannel, GetTimebase2, RunBlock, SetDataBuffers, GetValues, MaximumValue).
 
 import ctypes
-from picosdk.ps3000a import ps3000a as ps
+import math
+import time
 import numpy as np
-import matplotlib.pyplot as plt
 import matplotlib
-matplotlib.use("Qt5Agg")  # or "Qt5Agg" if you have PyQt5/PySide installed
+matplotlib.use("Qt5Agg")  # or any backend you use
+import matplotlib.pyplot as plt
+
+from picosdk.ps3000a import ps3000a as ps
 from picosdk.functions import adc2mV, assert_pico_ok
 
-# Create chandle and status ready for use
-status = {}
-chandle = ctypes.c_int16()
+# ---------------------------
+# User parameters
+# ---------------------------
+F_START = 30_000.0
+F_STOP  = 60_000.0
+PTS_PER_DECADE = 2000
+N_POINTS = int(round(PTS_PER_DECADE * math.log10(F_STOP/F_START)))  # ~602
+VPP_SIGNAL_UV = 2_000_000   # 2 Vpp in microvolts for SigGen
+RS_OHMS = 100.0             # precision shunt; adjust to your DUTs
+CH_RANGE_A = 8              # PS3000A_10V (example); adjust to your expected Vdut
+CH_RANGE_B = 7              # PS3000A_5V (example); adjust to your expected Vshunt
+COUPLING_DC = 1             # PS3000A_DC
+N_CYCLES_CAPTURE = 16       # total captured cycles per tone (before trimming)
+SETTLE_CYCLES = 2           # cycles to discard at start of record
+MIN_SAMP_PER_CYCLE = 64     # ≥64 samples/cycle for clean phase
+TIMEBASE_START_GUESS = 2    # will iterate upward until constraints are met
 
-# Opens the device/s
-status["openunit"] = ps.ps3000aOpenUnit(ctypes.byref(chandle), None)
+# ---------------------------
+# Helpers
+# ---------------------------
+def logspace_frequencies(f_start, f_stop, n):
+    return np.geomspace(f_start, f_stop, n)
 
-try:
-    assert_pico_ok(status["openunit"])
-except:
+def choose_timebase_for_f(handle, f_hz, n_cycles, min_samples_per_cycle, tb_guess=TIMEBASE_START_GUESS):
+    """
+    Iterate timebase until both:
+      - samples per cycle >= min_samples_per_cycle
+      - total samples >= n_cycles * samples_per_cycle
+    Returns (timebase, n_total_samples, dt_ns)
+    """
+    # We will try a set of candidate total samples per tone (powers of two-ish), then find a timebase that satisfies min samp/cycle
+    # Start from a practical target duration: Tcap = n_cycles / f
+    T_target = n_cycles / f_hz
+    # We'll aim for total samples near fs*T_target with fs derived from dt_ns once we know it.
+    # Practical approach: iterate timebase and pick a total_samples that gives >= MIN_SAMP_PER_CYCLE at f_hz and >= n_cycles*MIN_SAMP_PER_CYCLE total
+    # Use a modest range of total_samples to try; increase if needed.
+    for total_samples in [4096, 8192, 16384, 32768, 65536]:
+        tb = tb_guess
+        while tb < 25_000:  # arbitrary safety ceiling
+            timeIntervalns = ctypes.c_float()
+            returnedMaxSamples = ctypes.c_int32()
+            status = ps.ps3000aGetTimebase2(handle, tb, total_samples,
+                                            ctypes.byref(timeIntervalns),
+                                            1, ctypes.byref(returnedMaxSamples), 0)
+            if status == 0:  # PICO_OK
+                dt_ns = float(timeIntervalns.value)
+                fs = 1e9 / dt_ns
+                spc = fs / f_hz  # samples per cycle
+                if spc >= min_samples_per_cycle:
+                    # ensure our requested total_samples is not above driver limit
+                    n_tot = min(total_samples, int(returnedMaxSamples.value))
+                    if n_tot >= int(n_cycles * min_samples_per_cycle):
+                        return tb, n_tot, dt_ns
+            tb += 1
+    raise RuntimeError("Could not find a suitable timebase / record length for f = %.1f Hz" % f_hz)
 
-    # powerstate becomes the status number of openunit
-    powerstate = status["openunit"]
+def setup_scope(handle):
+    # Open & power source handling already done by caller; set up channels
+    # CH A: Vdut
+    st = ps.ps3000aSetChannel(handle, 0, 1, COUPLING_DC, CH_RANGE_A, 0.0)
+    assert_pico_ok(st)
+    # CH B: Vshunt
+    st = ps.ps3000aSetChannel(handle, 1, 1, COUPLING_DC, CH_RANGE_B, 0.0)
+    assert_pico_ok(st)
+    # Disable triggering (free-run). We'll capture steady-state sine anyway.
+    st = ps.ps3000aSetSimpleTrigger(handle, 0, 0, 0, 0, 0, 0)
+    assert_pico_ok(st)
 
-    # If powerstate is the same as 282 then it will run this if statement
-    if powerstate == 282:
-        # Changes the power input to "PICO_POWER_SUPPLY_NOT_CONNECTED"
-        status["ChangePowerSource"] = ps.ps3000aChangePowerSource(chandle, 282)
-        # If the powerstate is the same as 286 then it will run this if statement
-    elif powerstate == 286:
-        # Changes the power input to "PICO_USB3_0_DEVICE_NON_USB3_0_PORT"
-        status["ChangePowerSource"] = ps.ps3000aChangePowerSource(chandle, 286)
-    else:
-        raise
+def set_siggen_sine(handle, freq_hz, vpp_uV=VPP_SIGNAL_UV):
+    """
+    Use ps3000aSetSigGenBuiltInV2 to emit a steady sine at freq_hz with 0 offset.
+    We'll start/stop by calling this each tone with start=stop=freq.
+    """
+    offset_uV = 0
+    waveType = 0   # PS3000A_SINE
+    startFrequency = ctypes.c_double(freq_hz)
+    stopFrequency  = ctypes.c_double(freq_hz)
+    increment      = ctypes.c_double(0.0)
+    dwellTime      = ctypes.c_double(0.0)
+    sweepType = 0  # PS3000A_UP (unused for single tone)
+    operation = 0  # PS3000A_ES_OFF
+    shots = 0
+    sweeps = 0
+    triggerType = 0   # off (immediate output)
+    triggerSource = 0 # off
+    extInThreshold = 0
 
-    assert_pico_ok(status["ChangePowerSource"])
+    st = ps.ps3000aSetSigGenBuiltInV2(handle,
+                                      ctypes.c_int32(offset_uV),
+                                      ctypes.c_uint32(vpp_uV),
+                                      ctypes.c_int32(waveType),
+                                      startFrequency, stopFrequency,
+                                      increment, dwellTime,
+                                      ctypes.c_int32(sweepType),
+                                      ctypes.c_int32(operation),
+                                      ctypes.c_uint32(shots),
+                                      ctypes.c_uint32(sweeps),
+                                      ctypes.c_int32(triggerType),
+                                      ctypes.c_int32(triggerSource),
+                                      ctypes.c_int16(extInThreshold))
+    assert_pico_ok(st)
 
-# Set up channel A
-# handle = chandle
-# channel = PS3000A_CHANNEL_A = 0
-# enabled = 1
-# coupling type = PS3000A_DC = 1
-# range = PS3000A_10V = 8
-# analogue offset = 0 V
-chARange = 8
-status["setChA"] = ps.ps3000aSetChannel(chandle, 0, 1, 1, chARange, 0)
-assert_pico_ok(status["setChA"])
+def stop_siggen(handle):
+    # Zero the amplitude to stop output
+    set_siggen_sine(handle, 1.0, vpp_uV=0)
 
-# Sets up single trigger
-# Handle = Chandle
-# Source = ps3000A_channel_B = 0
-# Enable = 0
-# Threshold = 1024 ADC counts
-# Direction = ps3000A_Falling = 3
-# Delay = 0
-# autoTrigger_ms = 1000
-status["trigger"] = ps.ps3000aSetSimpleTrigger(chandle, 1, 0, 1024, 3, 0, 1000)
-assert_pico_ok(status["trigger"])
+def acquire_block_two_channels(handle, timebase, n_samples):
+    # Prepare buffers
+    bufA_max = (ctypes.c_int16 * n_samples)()
+    bufA_min = (ctypes.c_int16 * n_samples)()
+    bufB_max = (ctypes.c_int16 * n_samples)()
+    bufB_min = (ctypes.c_int16 * n_samples)()
 
-# Setting the number of sample to be collected
-preTriggerSamples = 40000
-postTriggerSamples = 40000
-maxsamples = preTriggerSamples + postTriggerSamples
+    # Set buffers (A=0, B=1)
+    st = ps.ps3000aSetDataBuffers(handle, 0, ctypes.byref(bufA_max), ctypes.byref(bufA_min), n_samples, 0, 0)
+    assert_pico_ok(st)
+    st = ps.ps3000aSetDataBuffers(handle, 1, ctypes.byref(bufB_max), ctypes.byref(bufB_min), n_samples, 0, 0)
+    assert_pico_ok(st)
 
-# Gets timebase innfomation
-# WARNING: When using this example it may not be possible to access all Timebases as all channels are enabled by default when opening the scope.
-# To access these Timebases, set any unused analogue channels to off.
-# Handle = chandle
-# Timebase = 2 = timebase
-# Nosample = maxsamples
-# TimeIntervalNanoseconds = ctypes.byref(timeIntervalns)
-# MaxSamples = ctypes.byref(returnedMaxSamples)
-# Segement index = 0
-timebase = 2
-timeIntervalns = ctypes.c_float()
-returnedMaxSamples = ctypes.c_int16()
-status["GetTimebase"] = ps.ps3000aGetTimebase2(chandle, timebase, maxsamples, ctypes.byref(timeIntervalns), 1, ctypes.byref(returnedMaxSamples), 0)
-assert_pico_ok(status["GetTimebase"])
+    # Run block
+    timeIndisposedMs = ctypes.c_int32()
+    st = ps.ps3000aRunBlock(handle, 0, n_samples, timebase, 1, ctypes.byref(timeIndisposedMs), 0, None, None)
+    assert_pico_ok(st)
 
-# Creates a overlow location for data
-overflow = ctypes.c_int16()
-# Creates converted types maxsamples
-cmaxSamples = ctypes.c_int32(maxsamples)
+    # Wait ready
+    ready = ctypes.c_int16(0)
+    while ready.value == 0:
+        ps.ps3000aIsReady(handle, ctypes.byref(ready))
 
-# Starts the block capture
-# Handle = chandle
-# Number of prTriggerSamples
-# Number of postTriggerSamples
-# Timebase = 2 = 4ns (see Programmer's guide for more information on timebases)
-# time indisposed ms = None (This is not needed within the example)
-# Segment index = 0
-# LpRead = None
-# pParameter = None
-status["runblock"] = ps.ps3000aRunBlock(chandle, preTriggerSamples, postTriggerSamples, timebase, 1, None, 0, None, None)
-assert_pico_ok(status["runblock"])
+    # Get data
+    cSamples = ctypes.c_int32(n_samples)
+    overflow = ctypes.c_int16()
+    st = ps.ps3000aGetValues(handle, 0, ctypes.byref(cSamples), 0, 0, 0, ctypes.byref(overflow))
+    assert_pico_ok(st)
 
-# Create buffers ready for assigning pointers for data collection
-bufferAMax = (ctypes.c_int16 * maxsamples)()
-bufferAMin = (ctypes.c_int16 * maxsamples)() # used for downsampling which isn't in the scope of this example
+    # Stop acquisition engine (not strictly necessary between blocks, but clean)
+    st = ps.ps3000aStop(handle)
+    assert_pico_ok(st)
 
-# Setting the data buffer location for data collection from channel A
-# Handle = Chandle
-# source = ps3000A_channel_A = 0
-# Buffer max = ctypes.byref(bufferAMax)
-# Buffer min = ctypes.byref(bufferAMin)
-# Buffer length = maxsamples
-# Segment index = 0
-# Ratio mode = ps3000A_Ratio_Mode_None = 0
-status["SetDataBuffers"] = ps.ps3000aSetDataBuffers(chandle, 0, ctypes.byref(bufferAMax), ctypes.byref(bufferAMin), maxsamples, 0, 0)
-assert_pico_ok(status["SetDataBuffers"])
+    return np.frombuffer(bufA_max, dtype=np.int16, count=n_samples), np.frombuffer(bufB_max, dtype=np.int16, count=n_samples)
 
-# Creates a overlow location for data
-overflow = (ctypes.c_int16 * 10)()
-# Creates converted types maxsamples
-cmaxSamples = ctypes.c_int32(maxsamples)
+def counts_to_volts(handle, counts_array, ch_range):
+    maxADC = ctypes.c_int16()
+    st = ps.ps3000aMaximumValue(handle, ctypes.byref(maxADC))
+    assert_pico_ok(st)
+    mv = adc2mV(counts_array, ch_range, maxADC)  # returns numpy array (mV)
+    return mv * 1e-3  # to volts
 
-# Checks data collection to finish the capture
-ready = ctypes.c_int16(0)
-check = ctypes.c_int16(0)
-while ready.value == check.value:
-    status["isReady"] = ps.ps3000aIsReady(chandle, ctypes.byref(ready))
+def trim_settle_cycles(x, fs, f_tone, settle_cycles):
+    n_settle = int(round(settle_cycles * fs / f_tone))
+    return x[n_settle:]
 
-# Handle = chandle
-# start index = 0
-# noOfSamples = ctypes.byref(cmaxSamples)
-# DownSampleRatio = 0
-# DownSampleRatioMode = 0
-# SegmentIndex = 0
-# Overflow = ctypes.byref(overflow)
+def single_bin_phasor(x, fs, f_tone):
+    """
+    Compute complex phasor at f_tone by correlation with e^{-j2πft} over the record.
+    Returns complex amplitude (linear volts).
+    """
+    n = len(x)
+    t = np.arange(n) / fs
+    ref = np.exp(-1j * 2 * np.pi * f_tone * t)
+    # Least-squares demodulation (complex)
+    ph = (2.0 / n) * np.dot(ref, x)  # scale ~ RMS-consistent for pure sine
+    return ph
 
-status["GetValues"] = ps.ps3000aGetValues(chandle, 0, ctypes.byref(cmaxSamples), 0, 0, 0, ctypes.byref(overflow))
-assert_pico_ok(status["GetValues"])
+def bode_plot(freqs, Z_complex):
+    mag = np.abs(Z_complex)
+    pha = np.angle(Z_complex, deg=True)
 
-# Finds the max ADC count
-# Handle = chandle
-# Value = ctype.byref(maxADC)
-maxADC = ctypes.c_int16()
-status["maximumValue"] = ps.ps3000aMaximumValue(chandle, ctypes.byref(maxADC))
-assert_pico_ok(status["maximumValue"])
+    fig1 = plt.figure()
+    plt.semilogx(freqs, mag)
+    plt.xlabel("Frequency (Hz)")
+    plt.ylabel("|Z| (Ohms)")
+    plt.title("Impedance magnitude")
 
-# Converts ADC from channel A to mV
-adc2mVChAMax =  adc2mV(bufferAMax, chARange, maxADC)
+    fig2 = plt.figure()
+    plt.semilogx(freqs, pha)
+    plt.xlabel("Frequency (Hz)")
+    plt.ylabel("Phase (deg)")
+    plt.title("Impedance phase")
 
-# Creates the time data
-time = np.linspace(0, (cmaxSamples.value - 1) * timeIntervalns.value, cmaxSamples.value)
+    plt.show()
 
-# Plots the data from channel A onto a graph
-plt.plot(time, adc2mVChAMax[:])
-plt.xlabel('Time (ns)')
-plt.ylabel('Voltage (mV)')
-plt.show()
+def main():
+    status = {}
+    chandle = ctypes.c_int16()
 
-# Stops the scope
-# Handle = chandle
-status["stop"] = ps.ps3000aStop(chandle)
-assert_pico_ok(status["stop"])
+    # Open device
+    status["openunit"] = ps.ps3000aOpenUnit(ctypes.byref(chandle), None)
+    try:
+        assert_pico_ok(status["openunit"])
+    except:  # handle power source negotiation
+        powerstate = status["openunit"]
+        if powerstate in (282, 286):
+            status["ChangePowerSource"] = ps.ps3000aChangePowerSource(chandle, powerstate)
+            assert_pico_ok(status["ChangePowerSource"])
+        else:
+            raise
 
-# Closes the unit
-# Handle = chandle
-status["close"] = ps.ps3000aCloseUnit(chandle)
-assert_pico_ok(status["close"])
+    h = chandle
+    setup_scope(h)
 
-# Displays the staus returns
-print(status)
+    # Frequency plan
+    freqs = logspace_frequencies(F_START, F_STOP, N_POINTS)
+    Z = np.zeros_like(freqs, dtype=np.complex128)
+
+    # We'll reuse one timebase if it suffices worst-case (60 kHz). If not, we adapt per tone.
+    # First choose for F_STOP
+    tb, n_samp, dt_ns = choose_timebase_for_f(h, F_STOP, N_CYCLES_CAPTURE, MIN_SAMP_PER_CYCLE, TIMEBASE_START_GUESS)
+    fs = 1e9 / dt_ns
+
+    # Start sweep
+    for i, f in enumerate(freqs):
+        # Check if current timebase still meets constraints; if not, pick a new one
+        spc = fs / f
+        n_tot_need = int(N_CYCLES_CAPTURE * MIN_SAMP_PER_CYCLE)
+        if (spc < MIN_SAMP_PER_CYCLE) or (n_samp < n_tot_need):
+            tb, n_samp, dt_ns = choose_timebase_for_f(h, f, N_CYCLES_CAPTURE, MIN_SAMP_PER_CYCLE, tb)
+            fs = 1e9 / dt_ns
+
+        # Program SigGen for single steady tone at f, 2 Vpp
+        set_siggen_sine(h, f, VPP_SIGNAL_UV)
+        # Small wait to ensure generator has settled (fraction of a cycle is enough)
+        time.sleep(max(3.0/f, 1e-4))
+
+        # Acquire block on both channels
+        a_counts, b_counts = acquire_block_two_channels(h, tb, n_samp)
+
+        # Convert to volts
+        vA = counts_to_volts(h, a_counts, CH_RANGE_A)  # Vdut
+        vB = counts_to_volts(h, b_counts, CH_RANGE_B)  # Vshunt
+
+        # Trim initial settle cycles
+        vA = trim_settle_cycles(vA, fs, f, SETTLE_CYCLES)
+        vB = trim_settle_cycles(vB, fs, f, SETTLE_CYCLES)
+
+        # Recompute fs-aligned t (length changed)
+        # (We pass fs and f directly to the demod; length is implicit via arrays)
+        VA = single_bin_phasor(vA, fs, f)
+        VB = single_bin_phasor(vB, fs, f)
+
+        I = VB / RS_OHMS
+        Z[i] = VA / I
+
+    # Stop generator and close
+    stop_siggen(h)
+    status["stop"] = ps.ps3000aStop(h)
+    assert_pico_ok(status["stop"])
+    status["close"] = ps.ps3000aCloseUnit(h)
+    assert_pico_ok(status["close"])
+
+    # Plot
+    bode_plot(freqs, Z)
+
+    # Also return arrays if run as a module
+    return freqs, Z
+
+if __name__ == "__main__":
+    main()
