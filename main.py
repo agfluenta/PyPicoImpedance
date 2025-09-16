@@ -82,39 +82,41 @@ def setup_scope(handle):
     st = ps.ps3000aSetSimpleTrigger(handle, 0, 0, 0, 0, 0, 0)
     assert_pico_ok(st)
 
-def set_siggen_sine(handle, freq_hz, vpp_uV=VPP_SIGNAL_UV):
+def set_siggen_sine(handle, freq_hz, vpp_uV=2_000_000):
     """
-    Use ps3000aSetSigGenBuiltInV2 to emit a steady sine at freq_hz with 0 offset.
-    We'll start/stop by calling this each tone with start=stop=freq.
+    Emit a steady sine at freq_hz with 0 offset using ps3000aSetSigGenBuiltIn.
     """
     offset_uV = 0
     waveType = 0   # PS3000A_SINE
-    startFrequency = ctypes.c_double(freq_hz)
-    stopFrequency  = ctypes.c_double(freq_hz)
-    increment      = ctypes.c_double(0.0)
-    dwellTime      = ctypes.c_double(0.0)
-    sweepType = 0  # PS3000A_UP (unused for single tone)
+    startFrequency = ctypes.c_float(freq_hz)
+    stopFrequency  = ctypes.c_float(freq_hz)
+    increment      = ctypes.c_float(0.0)
+    dwellTime      = ctypes.c_float(0.0)
+    sweepType = 0  # PS3000A_UP (ignored for single-tone)
     operation = 0  # PS3000A_ES_OFF
     shots = 0
     sweeps = 0
-    triggerType = 0   # off (immediate output)
-    triggerSource = 0 # off
+    triggerType = 0   # PS3000A_SIGGEN_TRIG_NONE (immediate output)
+    triggerSource = 0 # PS3000A_SIGGEN_NONE
     extInThreshold = 0
 
-    st = ps.ps3000aSetSigGenBuiltInV2(handle,
-                                      ctypes.c_int32(offset_uV),
-                                      ctypes.c_uint32(vpp_uV),
-                                      ctypes.c_int32(waveType),
-                                      startFrequency, stopFrequency,
-                                      increment, dwellTime,
-                                      ctypes.c_int32(sweepType),
-                                      ctypes.c_int32(operation),
-                                      ctypes.c_uint32(shots),
-                                      ctypes.c_uint32(sweeps),
-                                      ctypes.c_int32(triggerType),
-                                      ctypes.c_int32(triggerSource),
-                                      ctypes.c_int16(extInThreshold))
+    st = ps.ps3000aSetSigGenBuiltIn(
+        handle,
+        ctypes.c_int32(offset_uV),
+        ctypes.c_uint32(vpp_uV),
+        ctypes.c_int32(waveType),
+        startFrequency, stopFrequency,
+        increment, dwellTime,
+        ctypes.c_int32(sweepType),
+        ctypes.c_int32(operation),
+        ctypes.c_uint32(shots),
+        ctypes.c_uint32(sweeps),
+        ctypes.c_int32(triggerType),
+        ctypes.c_int32(triggerSource),
+        ctypes.c_int16(extInThreshold)
+    )
     assert_pico_ok(st)
+
 
 def stop_siggen(handle):
     # Zero the amplitude to stop output
